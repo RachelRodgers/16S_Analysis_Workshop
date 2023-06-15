@@ -1,0 +1,193 @@
+---
+title: "DADA2 Example: 16S Analysis Workshop"
+author: "Rachel Rodgers"
+date: '`r format(Sys.Date(), "%B, %d, %Y")`'
+output: 
+  html_document:
+    code_folding: hide
+---
+
+## Introduction
+
+In this workflow, we walk through the DADA2 pipeline to convert our raw sequencing data into a phyloseq object that is ready for 16S analyses. We are working with a small data set of 12 stool samples from mice raised in two different housing facilities. In later analyses, we will compare the bacterial communities of mice from Facility 1 to mice from Facility 2.
+
+## Document Set Up
+
+RMarkdown documents such as this are useful ways to conduct analyses and share results with others. The primary advantage is you can combine runnable code chunks with plain text which allow the document to function as a "notebook" where you can make notes and explain your analysis steps. 
+
+RMarkdowns are "knitted" into output files in a different format such as html. The parameters controlling how the output document is formatted can be set in a code chunk such as the one below. This will propagate to all the code chunks. However, individual code chunks can be formatted as well. There are many options for the global options code chunk but the only things I have specified below is to not display warnings or messages in the final report. Please see this link for more code chunk options: https://rmarkdown.rstudio.com/lesson-3.html
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=8,
+                      fig.height=6,
+                      warning=FALSE,
+                      message=FALSE)
+```
+
+## Loading Libraries & Setting Directories
+
+First we load the required libraries for our analyses.
+
+```{r load-libraries}
+library("dada2")
+library("msa")
+library("phangorn")
+library("phyloseq")
+library("tidyverse")
+```
+
+Next, we'll set paths to our input data, as well as the path to the RDP database that we will need to annotate our ASVs. We will also set a path to where we want our filtered data to go. Note that because we are using an R Project, we can use relative paths to our data without needing to manually set the current working directory.
+
+```{r set-directories}
+#----- Raw Data & Filtered Data Paths -----#
+
+inputDir <- "../data/raw_data"
+filteredDir <- "../data/filtered"
+
+#----- Taxonomy Database Paths -----#
+taxonomyDBPath <- "../data/dada2_taxonomy"
+
+# RDP
+rdpDB <- file.path(taxonomyDBPath, "rdp_train_set_16.fa.gz")
+rdpDBSpecies <- file.path(taxonomyDBPath, "rdp_species_assignment_16.fa.gz")
+```
+
+## Check the Raw Read Quality
+
+Now we will examine the aggregated raw read quality to see if the reads need to be trimmed or filtered.
+
+```{r rawQualPlot}
+rawQualPlot <- plotQualityProfile(inputDir, aggregate = TRUE)
+rawQualPlot
+```
+The mean quality score at each position is shown by the green line. Generally, I look to see that the green line remains above a quality score of 25 - 30, but this standard can change for each experiment. In this case the reads maintain good quality throughout their length. We will filter the last few nucleotides of each read to avoid errors that may arise there, as per the DADA2 documentation. We will trim the reads to 240 bp and include additional filtering parameters that I use across all 16S data sets. All available filtering and trimming parameters can be reviewed in the filterAndTrim() functions's help menu. Type ?filterAndTrim to see more.
+
+```{r filter-and-trim}
+# Note the chunk parameter eval=FALSE will prevent this code chunk from automatically
+#   re-running, for example, when knitting the document.
+filterAndTrim(fwd = inputDir,
+              filt = filteredDir,
+              truncLen = 240, trimLeft = 10, maxEE = 2, truncQ = 11, maxN = 0, 
+              rm.phix = TRUE, compress = TRUE, verbose = TRUE)
+```
+
+## Learn the Error Rates
+
+In order for the DADA2 algorithm to identify ASVs in the data, we first need to generate an error model from the data. This is more complex stuff than I usually think about. Feel free to read more at the DADA2 website!
+
+```{r filteredFiles}
+# Generate a list of filtered files and assign sample names to them:
+filteredFiles <- list.files(filteredDir, pattern = "fastq", full.names = TRUE)
+
+# Get the sample name by removing the _R1.fastq extension and the path
+sampleNames <- map_chr(basename(filteredFiles),
+                       ~ str_remove(string = .x, pattern = "_R1.fastq$"))
+
+# Assign the sample names to the filteredFiles vector
+names(filteredFiles) <- sampleNames
+```
+
+```{r learn-errors}
+# Now it's time to learn the error rates. We set a seed value to make these
+#   results reproducible. Otherwise the result will change slightly due to the
+#   nature of the computation.
+set.seed(58885042)
+
+# This function takes about 4 minutes to run on my Windows laptop:
+errF <- learnErrors(filteredFiles, multithread = TRUE)
+
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+errorPlot
+```
+The error rates are shown in the above graph. The red line is what is expected, the black line represents an estimate, and the dots are the observed. The black dots should track well with the black line. If you wanted to improve this estimate, then you could re-run the learnErrors() function and increase the number of bases used in the estimate by increasing the nbases parameter to something greater than 1e8 (the default).
+
+## Run DADA2 to Generate an ASV Table
+
+Now we're ready to apply the DADA2 algorithm to our data. This algorithm will infer true sequence variants from the unique sequences found in our data. The end result will be an ASV table.
+
+```{r sequenceTable}
+# Create a list that will hold dereplication objects for each sample
+singles <- vector("list", length(sampleNames))
+names(singles) <- sampleNames
+
+# This loop takes about 1 minute to run on my laptop:
+for(sample in sampleNames) {
+  derepF <- derepFastq(filteredFiles[[sample]])
+  singles[[sample]] <- dada(derepF, err = errF, multithread = TRUE)
+}
+
+# Construct the sequence table and remove chimeras
+sequenceTable <- makeSequenceTable(singles)
+sequenceTableNoChimeras <- removeBimeraDenovo(sequenceTable,
+                                              multithread = TRUE)
+
+```
+
+## Assign Taxonomies to the ASVs to Generate an ASV Table
+
+Now we'll assign taxonomy to our inferred ASV sequences using the RDP taxonomy.
+
+```{r assign-taxonomy}
+taxaRankNamesFull <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+taxaRankNamesTrunc <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus")
+
+# RDP
+taxaRDP <- assignTaxonomy(sequenceTableNoChimeras, rdpDB, multithread = TRUE)
+colnames(taxaRDP) <- taxaRankNamesTrunc
+taxaRDPPlus <- addSpecies(taxaRDP, rdpDBSpecies)
+```
+
+## Construct a Phylogenetic Tree
+
+A phylogenetic tree is needed to calculate metrics such as Faith's Phylogenetic Diversity, and weighted UniFrac. This  code chunk can take several minutes to run (even longer with large data sets).
+
+```{r construct-phylogenetic-tree}
+# Get the sequences from the sequence table
+seqs <- getSequences(sequenceTableNoChimeras)
+names(seqs) <- seqs
+```
+
+```{r write-out-seqs-for-clustalW, eval=FALSE}
+# for use with clustalW 2.1 on the HTCF
+
+# convert seqs to fasta-format
+
+```
+
+
+```{r msa, eval=FALSE}
+# Multiple sequence alignment
+mult <- msa(seqs, method = "ClustalW", type = "dna", order = "input")
+# Convert MSA to phyDAT format
+phangAlign <- as.phyDat(mult, type = "dna", order = "input")
+# Compute pairwise distances on phangAlign
+dm <- dist.ml(phangAlign)
+treeNJ <- NJ(dm)
+# Compute likelihood of tree
+fit <- pml(tree = treeNJ, data = phangAlign)
+fitGTR <- update(fit, k = 4, inv = 0.2)
+fitGTR <- optim.pml(fitGTR, model = "GTR", optInv = TRUE, optGamma = TRUE,
+                    rearrangement = "stochastic", 
+                    control = pml.control(trace = 0))
+```
+
+## Construct a PhyloSeq Object from the DADA2 Output
+
+Now we're ready to combine the ASV table, taxonomy table, and phylogenetic tree into a PhyloSeq object.
+
+```{r build-phyloseq-object}
+dir.create("../data/physeqObjects")
+
+# ps0.rdp is the phyloseq object:
+ps0.rdp <- phyloseq(otu_table(sequenceTableNoChimeras, taxa_are_rows = FALSE),
+                    tax_table(taxaRDPPlus), phy_tree(fitGTR$tree))
+
+saveRDS(ps0.rdp, "../data/physeqObjects/ps0.rdp_single.RDS")
+```
+
+## Save Data
+
+```{r save-data}
+save.image("16S_Analysis_Workshop_DADA2.RData") # read back w/ load() or attach()
+```
+
